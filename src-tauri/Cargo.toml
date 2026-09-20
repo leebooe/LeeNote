@@ -1,6 +1,6 @@
 [package]
 name = "leenote"
-version = "0.1.0"
+version = "0.1.12"
 description = "A lightweight Markdown sticky note app"
 authors = ["LeeNote"]
 edition = "2021"
@@ -16,4 +16,4 @@ tauri-build = { version = "2", features = [] }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 tauri = { version = "2", features = ["macos-private-api", "tray-icon"] }
-
+rfd = "0.15"

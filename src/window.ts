@@ -1,3 +1,4 @@
+import { getCurrentWindow } from "@tauri-apps/api/window";
 import type { WindowLayer } from "./types";
 
 export function isTauri() {
@@ -6,7 +7,6 @@ export function isTauri() {
 
 export async function applyWindowLayer(layer: WindowLayer) {
   if (!isTauri()) return;
-  const { getCurrentWindow } = await import("@tauri-apps/api/window");
   const appWindow = getCurrentWindow();
   await appWindow.setAlwaysOnTop(layer === "top");
   await appWindow.setAlwaysOnBottom(layer === "bottom");
@@ -14,12 +14,20 @@ export async function applyWindowLayer(layer: WindowLayer) {
 
 export async function minimizeWindow() {
   if (!isTauri()) return;
-  const { getCurrentWindow } = await import("@tauri-apps/api/window");
   await getCurrentWindow().minimize();
+}
+
+export async function startWindowDragging() {
+  if (!isTauri()) return;
+  await getCurrentWindow().startDragging();
+}
+
+export async function toggleMaximizeWindow() {
+  if (!isTauri()) return;
+  await getCurrentWindow().toggleMaximize();
 }
 
 export async function closeWindow() {
   if (!isTauri()) return;
-  const { getCurrentWindow } = await import("@tauri-apps/api/window");
   await getCurrentWindow().hide();
 }

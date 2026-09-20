@@ -1,4 +1,4 @@
-import type { Note, Settings } from "./types";
+import type { DetachedNoteState, Note, Settings } from "./types";
 
 const NOTES_KEY = "leenote.notes.v1";
 const SETTINGS_KEY = "leenote.settings.v1";
@@ -19,6 +19,9 @@ export const defaultSettings: Settings = {
   windowLayer: "normal",
   theme: "system",
   sidebarOpen: true,
+  storagePath: "",
+  groups: [],
+  detachedNotes: {},
 };
 
 export function createNote(overrides: Partial<Note> = {}): Note {
@@ -30,6 +33,7 @@ export function createNote(overrides: Partial<Note> = {}): Note {
     color: "sun",
     pinned: false,
     archived: false,
+    group: "",
     createdAt: now,
     updatedAt: now,
     ...overrides,
@@ -39,7 +43,9 @@ export function createNote(overrides: Partial<Note> = {}): Note {
 export function loadNotes(): Note[] {
   try {
     const raw = localStorage.getItem(NOTES_KEY);
-    if (raw) return JSON.parse(raw) as Note[];
+    if (raw) {
+      return (JSON.parse(raw) as Note[]).map((note) => ({ ...note, group: note.group ?? "" }));
+    }
   } catch {
     // Corrupted local data falls back to the starter note.
   }
@@ -53,7 +59,16 @@ export function saveNotes(notes: Note[]) {
 export function loadSettings(): Settings {
   try {
     const raw = localStorage.getItem(SETTINGS_KEY);
-    if (raw) return { ...defaultSettings, ...(JSON.parse(raw) as Partial<Settings>) };
+    if (raw) {
+      const stored = JSON.parse(raw) as Partial<Settings>;
+      const detachedNotes = Object.fromEntries(
+        Object.entries(stored.detachedNotes ?? {}).map(([noteId, state]) => [
+          noteId,
+          { ...state, layer: state.layer ?? "normal" } satisfies DetachedNoteState,
+        ]),
+      );
+      return { ...defaultSettings, ...stored, groups: stored.groups ?? [], detachedNotes };
+    }
   } catch {
     // Invalid preferences use safe defaults.
   }

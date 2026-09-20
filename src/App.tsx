@@ -1,13 +1,26 @@
-import { useCallback, useEffect, useMemo, useRef, useState } from "react";
+import {
+  useCallback,
+  useEffect,
+  useMemo,
+  useRef,
+  useState,
+  type MouseEvent as ReactMouseEvent,
+  type PointerEvent as ReactPointerEvent,
+} from "react";
 import {
   Archive,
   ArchiveRestore,
   Check,
-  ChevronLeft,
+  ChevronDown,
+  ChevronRight,
   Eye,
   FileDown,
   FilePenLine,
   FileUp,
+  Folder,
+  FolderOpen,
+  FolderPlus,
+  GripHorizontal,
   Layers2,
   Maximize2,
   Menu,
@@ -16,18 +29,36 @@ import {
   MoreHorizontal,
   PanelLeftClose,
   PanelLeftOpen,
+  Pencil,
   Plus,
   Search,
   Settings as SettingsIcon,
+  Square,
   Star,
   Sun,
   Trash2,
   X,
 } from "lucide-react";
 import { createNote, loadNotes, loadSettings, saveNotes, saveSettings } from "./data";
+import { openDetachedNoteWindow } from "./detached";
+import leeNoteLogo from "../assets/leenote-logo-white.png";
 import { renderMarkdown } from "./markdown";
+import {
+  chooseStorageDirectory,
+  getDefaultStorageDirectory,
+  loadNotesFromDirectory,
+  openStorageDirectory,
+  saveNotesToDirectory,
+} from "./storage";
 import type { Note, NoteColor, Settings, ViewMode, WindowLayer } from "./types";
-import { applyWindowLayer, closeWindow, minimizeWindow } from "./window";
+import {
+  applyWindowLayer,
+  closeWindow,
+  isTauri,
+  minimizeWindow,
+  startWindowDragging,
+  toggleMaximizeWindow,
+} from "./window";
 
 const colors: NoteColor[] = ["sun", "mint", "sky", "rose", "lavender", "paper"];
 
@@ -36,6 +67,8 @@ const layerLabels: Record<WindowLayer, string> = {
   normal: "普通层",
   top: "置顶层",
 };
+
+const isMacOS = /Mac|iPhone|iPad|iPod/i.test(navigator.platform);
 
 function formatTime(value: number) {
   const date = new Date(value);
@@ -61,25 +94,57 @@ export default function App() {
   const [activeId, setActiveId] = useState(() => notes[0]?.id ?? "");
   const [query, setQuery] = useState("");
   const [listFilter, setListFilter] = useState<"all" | "favorites" | "archived">("all");
+  const [groupTreeOpen, setGroupTreeOpen] = useState(true);
+  const [expandedGroups, setExpandedGroups] = useState<Set<string>>(
+    () => new Set(["__ungrouped__"]),
+  );
+  const [draggingNoteId, setDraggingNoteId] = useState<string | null>(null);
   const [showMore, setShowMore] = useState(false);
   const [showSettings, setShowSettings] = useState(false);
   const [systemDark, setSystemDark] = useState(() =>
     window.matchMedia("(prefers-color-scheme: dark)").matches,
   );
   const [saved, setSaved] = useState(true);
+  const [storageReady, setStorageReady] = useState(() => !isTauri());
   const titleInput = useRef<HTMLInputElement>(null);
   const importInput = useRef<HTMLInputElement>(null);
+  const storageInitialized = useRef(false);
+  const pointerDrag = useRef<{
+    note: Note;
+    pointerId: number;
+    startX: number;
+    startY: number;
+    dragging: boolean;
+  } | null>(null);
 
-  const activeNote = notes.find((note) => note.id === activeId) ?? notes[0];
+  const detachedNoteIds = useMemo(
+    () => new Set(Object.keys(settings.detachedNotes)),
+    [settings.detachedNotes],
+  );
+  const activeNote =
+    notes.find((note) => note.id === activeId && !detachedNoteIds.has(note.id)) ??
+    notes.find((note) => !detachedNoteIds.has(note.id));
+  const groups = useMemo(
+    () =>
+      Array.from(
+        new Set([...settings.groups, ...notes.map((note) => note.group).filter(Boolean)]),
+      ).sort((left, right) => left.localeCompare(right, "zh-CN")),
+    [notes, settings.groups],
+  );
 
   useEffect(() => {
     setSaved(false);
     const timer = window.setTimeout(() => {
-      saveNotes(notes);
-      setSaved(true);
+      void (async () => {
+        saveNotes(notes);
+        if (storageReady && settings.storagePath) {
+          await saveNotesToDirectory(settings.storagePath, notes);
+        }
+        setSaved(true);
+      })();
     }, 250);
     return () => window.clearTimeout(timer);
-  }, [notes]);
+  }, [notes, settings.storagePath, storageReady]);
 
   useEffect(() => {
     saveSettings(settings);
@@ -88,11 +153,119 @@ export default function App() {
   }, [settings]);
 
   useEffect(() => {
+    if (!isTauri() || storageInitialized.current) return;
+    storageInitialized.current = true;
+    void (async () => {
+      const directory = settings.storagePath || (await getDefaultStorageDirectory());
+      if (!settings.storagePath) {
+        setSettings((current) => ({ ...current, storagePath: directory }));
+      }
+      const storedNotes = await loadNotesFromDirectory(directory);
+      if (storedNotes?.length) {
+        setNotes(storedNotes.map((note) => ({ ...note, group: note.group ?? "" })));
+      } else {
+        await saveNotesToDirectory(directory, notes);
+      }
+      setStorageReady(true);
+    })();
+  }, []);
+
+  useEffect(() => {
+    const discoveredGroups = notes.map((note) => note.group).filter(Boolean);
+    if (discoveredGroups.every((group) => settings.groups.includes(group))) return;
+    setSettings((current) => ({
+      ...current,
+      groups: Array.from(new Set([...current.groups, ...discoveredGroups])),
+    }));
+  }, [notes, settings.groups]);
+
+  useEffect(() => {
     const media = window.matchMedia("(prefers-color-scheme: dark)");
     const updateSystemTheme = () => setSystemDark(media.matches);
     media.addEventListener("change", updateSystemTheme);
     return () => media.removeEventListener("change", updateSystemTheme);
   }, []);
+
+  useEffect(() => {
+    if (!("__TAURI_INTERNALS__" in window)) return;
+    const cleanup: Array<() => void> = [];
+    void (async () => {
+      const { listen } = await import("@tauri-apps/api/event");
+      cleanup.push(
+        await listen<Note>("leenote:note-updated", (event) => {
+          setNotes((current) =>
+            current.map((note) => (note.id === event.payload.id ? event.payload : note)),
+          );
+        }),
+      );
+      cleanup.push(
+        await listen<{ noteId: string }>("leenote:note-reattach", (event) => {
+          setSettings((current) => {
+            const detachedNotes = { ...current.detachedNotes };
+            delete detachedNotes[event.payload.noteId];
+            return { ...current, detachedNotes };
+          });
+          setActiveId(event.payload.noteId);
+        }),
+      );
+      cleanup.push(
+        await listen<{ noteId: string; x: number; y: number }>(
+          "leenote:note-window-moved",
+          (event) => {
+            setSettings((current) => {
+              if (!current.detachedNotes[event.payload.noteId]) return current;
+              return {
+                ...current,
+                detachedNotes: {
+                  ...current.detachedNotes,
+                  [event.payload.noteId]: {
+                    ...current.detachedNotes[event.payload.noteId],
+                    x: event.payload.x,
+                    y: event.payload.y,
+                  },
+                },
+              };
+            });
+          },
+        ),
+      );
+      cleanup.push(
+        await listen<{ noteId: string; layer: WindowLayer }>(
+          "leenote:note-window-layer",
+          (event) => {
+            setSettings((current) => {
+              const detached = current.detachedNotes[event.payload.noteId];
+              if (!detached) return current;
+              return {
+                ...current,
+                detachedNotes: {
+                  ...current.detachedNotes,
+                  [event.payload.noteId]: { ...detached, layer: event.payload.layer },
+                },
+              };
+            });
+          },
+        ),
+      );
+    })();
+    return () => cleanup.forEach((unlisten) => unlisten());
+  }, []);
+
+  useEffect(() => {
+    for (const [noteId, position] of Object.entries(settings.detachedNotes)) {
+      const note = notes.find((candidate) => candidate.id === noteId);
+      if (note) {
+        void openDetachedNoteWindow(note, position).catch(() => {
+          setSettings((current) => {
+            if (!current.detachedNotes[noteId]) return current;
+            const detachedNotes = { ...current.detachedNotes };
+            delete detachedNotes[noteId];
+            return { ...current, detachedNotes };
+          });
+        });
+      }
+    }
+  }, [notes, settings.detachedNotes]);
 
   const addNote = useCallback(() => {
     const note = createNote();
@@ -102,6 +275,17 @@ export default function App() {
     setListFilter("all");
     window.setTimeout(() => titleInput.current?.select(), 0);
   }, []);
+
+  const addNoteToGroup = (groupKey: string) => {
+    const group = groupKey === "__ungrouped__" ? "" : groupKey;
+    const note = { ...createNote(), group };
+    setNotes((current) => [note, ...current]);
+    setActiveId(note.id);
+    setQuery("");
+    setListFilter("all");
+    setExpandedGroups((current) => new Set(current).add(groupKey));
+    window.setTimeout(() => titleInput.current?.select(), 0);
+  };
 
   useEffect(() => {
     const onKeyDown = (event: KeyboardEvent) => {
@@ -130,23 +314,78 @@ export default function App() {
     };
   }, [addNote]);
 
-  const updateActive = (patch: Partial<Note>) => {
-    if (!activeNote) return;
+  const updateNote = (noteId: string, patch: Partial<Note>) => {
     setNotes((current) =>
       current.map((note) =>
-        note.id === activeNote.id ? { ...note, ...patch, updatedAt: Date.now() } : note,
+        note.id === noteId ? { ...note, ...patch, updatedAt: Date.now() } : note,
       ),
     );
+  };
+
+  const updateActive = (patch: Partial<Note>) => {
+    if (activeNote) updateNote(activeNote.id, patch);
+  };
+
+  const createGroup = (assignActiveNote = false) => {
+    const name = window.prompt("新建分组名称")?.trim();
+    if (!name) return;
+    setSettings((current) => ({
+      ...current,
+      groups: current.groups.includes(name) ? current.groups : [...current.groups, name],
+    }));
+    if (assignActiveNote && activeNote) updateActive({ group: name });
+    setExpandedGroups((current) => new Set(current).add(name));
+  };
+
+  const renameActiveGroup = () => {
+    const currentGroup = activeNote?.group;
+    if (!currentGroup) return;
+    const name = window.prompt("重命名分组", currentGroup)?.trim();
+    if (!name || name === currentGroup) return;
+    setNotes((current) =>
+      current.map((note) =>
+        note.group === currentGroup ? { ...note, group: name, updatedAt: Date.now() } : note,
+      ),
+    );
+    setSettings((current) => ({
+      ...current,
+      groups: Array.from(new Set(current.groups.map((group) => (group === currentGroup ? name : group)))),
+    }));
+    setExpandedGroups((current) => {
+      const next = new Set(current);
+      if (next.delete(currentGroup)) next.add(name);
+      return next;
+    });
+  };
+
+  const deleteActiveGroup = () => {
+    const currentGroup = activeNote?.group;
+    if (!currentGroup || !window.confirm(`删除分组“${currentGroup}”？分组内便签将移到未分组。`)) return;
+    setNotes((current) =>
+      current.map((note) =>
+        note.group === currentGroup ? { ...note, group: "", updatedAt: Date.now() } : note,
+      ),
+    );
+    setSettings((current) => ({
+      ...current,
+      groups: current.groups.filter((group) => group !== currentGroup),
+    }));
+    setExpandedGroups((current) => {
+      const next = new Set(current);
+      next.delete(currentGroup);
+      return next;
+    });
   };
 
   const filteredNotes = useMemo(() => {
     const needle = query.trim().toLocaleLowerCase();
     return notes
+      .filter((note) => !detachedNoteIds.has(note.id))
       .filter((note) => (listFilter === "archived" ? note.archived : !note.archived))
       .filter((note) => listFilter !== "favorites" || note.pinned)
       .filter((note) => !needle || `${note.title}\n${note.content}`.toLocaleLowerCase().includes(needle))
       .sort((a, b) => Number(b.pinned) - Number(a.pinned) || b.updatedAt - a.updatedAt);
-  }, [listFilter, notes, query]);
+  }, [detachedNoteIds, listFilter, notes, query]);
 
   const favoriteCount = useMemo(
     () => notes.filter((note) => note.pinned && !note.archived).length,
@@ -213,10 +452,129 @@ export default function App() {
     setShowMore(false);
   };
 
+  const changeStorageDirectory = async () => {
+    const directory = await chooseStorageDirectory();
+    if (!directory || directory === settings.storagePath) return;
+    await saveNotesToDirectory(directory, notes);
+    setSettings((current) => ({ ...current, storagePath: directory }));
+  };
+
+  const revealStorageDirectory = () => {
+    if (settings.storagePath) void openStorageDirectory(settings.storagePath);
+  };
+
   const effectiveTheme = settings.theme === "system" ? (systemDark ? "dark" : "light") : settings.theme;
 
+  const handleTitlebarMouseDown = (event: ReactMouseEvent<HTMLElement>) => {
+    if (event.button !== 0 || (event.target as HTMLElement).closest("button")) return;
+    event.preventDefault();
+    void startWindowDragging();
+  };
+
+  const beginDesktopDrag = (event: ReactPointerEvent<HTMLElement>, note: Note) => {
+    if (event.button !== 0) return;
+    pointerDrag.current = {
+      note,
+      pointerId: event.pointerId,
+      startX: event.clientX,
+      startY: event.clientY,
+      dragging: false,
+    };
+    event.currentTarget.setPointerCapture(event.pointerId);
+  };
+
+  const updateDesktopDrag = (event: ReactPointerEvent<HTMLElement>) => {
+    const drag = pointerDrag.current;
+    if (!drag || drag.pointerId !== event.pointerId) return;
+    if (!drag.dragging) {
+      const distance = Math.hypot(event.clientX - drag.startX, event.clientY - drag.startY);
+      if (distance < 5) return;
+      drag.dragging = true;
+      setDraggingNoteId(drag.note.id);
+    }
+    event.preventDefault();
+  };
+
+  const finishDesktopDrag = (event: ReactPointerEvent<HTMLElement>) => {
+    const drag = pointerDrag.current;
+    if (!drag || drag.pointerId !== event.pointerId) return;
+    pointerDrag.current = null;
+    if (event.currentTarget.hasPointerCapture(event.pointerId)) {
+      event.currentTarget.releasePointerCapture(event.pointerId);
+    }
+    setDraggingNoteId(null);
+    if (!drag.dragging) {
+      setActiveId(drag.note.id);
+      return;
+    }
+    event.preventDefault();
+    const outsideMainWindow =
+      event.clientX <= 0 ||
+      event.clientY <= 0 ||
+      event.clientX >= window.innerWidth - 1 ||
+      event.clientY >= window.innerHeight - 1;
+    if (!outsideMainWindow || (event.screenX === 0 && event.screenY === 0)) return;
+
+    const position = {
+      x: Math.max(0, event.screenX - 36),
+      y: Math.max(0, event.screenY - 22),
+      layer: "normal" as WindowLayer,
+    };
+    setSettings((current) => ({
+      ...current,
+      detachedNotes: { ...current.detachedNotes, [drag.note.id]: position },
+    }));
+  };
+
+  const cancelDesktopDrag = (event: ReactPointerEvent<HTMLElement>) => {
+    if (pointerDrag.current?.pointerId !== event.pointerId) return;
+    pointerDrag.current = null;
+    setDraggingNoteId(null);
+  };
+
+  const toggleGroupNode = (group: string) => {
+    setExpandedGroups((current) => {
+      const next = new Set(current);
+      if (next.has(group)) next.delete(group);
+      else next.add(group);
+      return next;
+    });
+  };
+
+  const renderTreeNote = (note: Note) => (
+    <div
+      className={`note-row tree-note-row ${note.id === activeNote?.id ? "active" : ""} ${draggingNoteId === note.id ? "is-dragging" : ""}`}
+      key={note.id}
+      role="button"
+      tabIndex={0}
+      onPointerDown={(event) => beginDesktopDrag(event, note)}
+      onPointerMove={updateDesktopDrag}
+      onPointerUp={finishDesktopDrag}
+      onPointerCancel={cancelDesktopDrag}
+      onKeyDown={(event) => {
+        if (event.key === "Enter" || event.key === " ") {
+          event.preventDefault();
+          setActiveId(note.id);
+        }
+      }}
+    >
+      <GripHorizontal className="note-drag-handle" size={14} />
+      <span className={`note-dot color-${note.color}`} />
+      <span className="note-copy">
+        <span className="note-row-title">
+          {note.title || "无标题"}
+          {note.pinned && <Star size={12} fill="currentColor" />}
+        </span>
+        <span className="note-row-excerpt">{excerpt(note.content) || "空白便签"}</span>
+      </span>
+      <span className="note-time">{formatTime(note.updatedAt)}</span>
+    </div>
+  );
+
   return (
-    <main className={`app-shell note-${activeNote?.color ?? "sun"}`}>
+    <main
+      className={`app-shell ${isMacOS ? "app-shell-macos" : "app-shell-windows"} note-${activeNote?.color ?? "sun"}`}
+    >
       <input
         ref={importInput}
         className="file-input"
@@ -228,12 +586,21 @@ export default function App() {
           event.target.value = "";
         }}
       />
-      <header className="titlebar" data-tauri-drag-region>
-        <div className="traffic-lights" aria-hidden="true">
-          <button className="traffic close" onClick={() => void closeWindow()} aria-label="隐藏窗口" />
-          <button className="traffic minimize" onClick={() => void minimizeWindow()} aria-label="最小化" />
-          <button className="traffic zoom" aria-label="缩放窗口" />
-        </div>
+      <header
+        className={`titlebar ${isMacOS ? "titlebar-macos" : "titlebar-windows"}`}
+        onMouseDown={handleTitlebarMouseDown}
+      >
+        {isMacOS && (
+          <div className="traffic-lights">
+            <button className="traffic close" onClick={() => void closeWindow()} aria-label="隐藏窗口" />
+            <button className="traffic minimize" onClick={() => void minimizeWindow()} aria-label="最小化" />
+            <button
+              className="traffic zoom"
+              onClick={() => void toggleMaximizeWindow()}
+              aria-label="最大化或还原"
+            />
+          </div>
+        )}
         <button
           className="icon-button sidebar-toggle"
           onClick={() => setSettings((current) => ({ ...current, sidebarOpen: !current.sidebarOpen }))}
@@ -241,17 +608,39 @@ export default function App() {
         >
           {settings.sidebarOpen ? <PanelLeftClose size={17} /> : <PanelLeftOpen size={17} />}
         </button>
-        <div className="drag-title" data-tauri-drag-region>
-          <span className="brand-mark">L</span>
+        <div className="drag-title">
+          <span className="brand-mark" aria-hidden="true">
+            <img src={leeNoteLogo} alt="" />
+          </span>
           <span>LeeNote</span>
         </div>
         <div className="window-actions">
-          <span className={`save-state ${saved ? "is-saved" : ""}`}>{saved ? "已保存" : "保存中…"}</span>
+          <span className={`save-state ${saved ? "is-saved" : ""}`}>
+            {saved ? "已保存" : "保存中…"}
+          </span>
           <button className="layer-button" onClick={cycleLayer} title="切换窗口层级">
             <Layers2 size={15} />
             {layerLabels[settings.windowLayer]}
           </button>
         </div>
+        {!isMacOS && (
+          <div className="windows-caption-buttons">
+            <button onClick={() => void minimizeWindow()} aria-label="最小化" title="最小化">
+              <Minus size={16} strokeWidth={1.5} />
+            </button>
+            <button onClick={() => void toggleMaximizeWindow()} aria-label="最大化或还原" title="最大化或还原">
+              <Square size={12} strokeWidth={1.5} />
+            </button>
+            <button
+              className="windows-close"
+              onClick={() => void closeWindow()}
+              aria-label="关闭"
+              title="关闭"
+            >
+              <X size={17} strokeWidth={1.5} />
+            </button>
+          </div>
+        )}
       </header>
 
       <div className="workspace">
@@ -302,24 +691,56 @@ export default function App() {
             </button>
           </nav>
 
-          <div className="note-list">
-            {filteredNotes.map((note) => (
-              <button
-                className={`note-row ${note.id === activeNote?.id ? "active" : ""}`}
-                key={note.id}
-                onClick={() => setActiveId(note.id)}
-              >
-                <span className={`note-dot color-${note.color}`} />
-                <span className="note-copy">
-                  <span className="note-row-title">
-                    {note.title || "无标题"}
-                    {note.pinned && <Star size={12} fill="currentColor" />}
-                  </span>
-                  <span className="note-row-excerpt">{excerpt(note.content) || "空白便签"}</span>
-                </span>
-                <span className="note-time">{formatTime(note.updatedAt)}</span>
+          <div className="note-list group-tree">
+            <div className="group-tree-root">
+              <button onClick={() => setGroupTreeOpen((open) => !open)}>
+                {groupTreeOpen ? <ChevronDown size={14} /> : <ChevronRight size={14} />}
+                <Folder size={14} />
+                <span>全部便签</span>
+                <small>{filteredNotes.length}</small>
               </button>
-            ))}
+              <button className="group-tree-add" onClick={() => createGroup()} title="新建分组" aria-label="新建分组">
+                <FolderPlus size={15} />
+              </button>
+            </div>
+            {groupTreeOpen && (
+              <div className="group-tree-branches">
+                {[
+                  { key: "__ungrouped__", label: "未分组", notes: filteredNotes.filter((note) => !note.group) },
+                  ...groups.map((group) => ({
+                    key: group,
+                    label: group,
+                    notes: filteredNotes.filter((note) => note.group === group),
+                  })),
+                ].map((branch) => {
+                  const expanded = expandedGroups.has(branch.key);
+                  return (
+                    <section
+                      className="group-tree-branch"
+                      key={branch.key}
+                    >
+                      <div className="group-tree-branch-head">
+                        <button className="group-tree-node" onClick={() => toggleGroupNode(branch.key)}>
+                          {expanded ? <ChevronDown size={13} /> : <ChevronRight size={13} />}
+                          <Folder size={13} />
+                          <span>{branch.label}</span>
+                          <small>{branch.notes.length}</small>
+                        </button>
+                        <button
+                          className="group-note-add"
+                          onClick={() => addNoteToGroup(branch.key)}
+                          title={`在${branch.label}中新建便签`}
+                          aria-label={`在${branch.label}中新建便签`}
+                        >
+                          <Plus size={14} />
+                        </button>
+                      </div>
+                      {expanded && <div className="group-tree-notes">{branch.notes.map(renderTreeNote)}</div>}
+                    </section>
+                  );
+                })}
+              </div>
+            )}
             {filteredNotes.length === 0 && (
               <div className="empty-search">
                 {listFilter === "favorites" && !query ? (
@@ -399,19 +820,19 @@ export default function App() {
                     </button>
                   ))}
                 </div>
-                <label>便签颜色</label>
-                <div className="settings-colors" aria-label="便签颜色">
-                  {colors.map((color) => (
-                    <button
-                      key={color}
-                      className={`color-choice color-${color} ${activeNote?.color === color ? "active" : ""}`}
-                      onClick={() => updateActive({ color })}
-                      aria-label={`选择 ${color} 颜色`}
-                      aria-pressed={activeNote?.color === color}
-                    >
-                      {activeNote?.color === color && <Check size={13} />}
+                <label>保存路径</label>
+                <div className="storage-path-setting">
+                  <div className="storage-path-value" title={settings.storagePath}>
+                    <FolderOpen size={14} />
+                    <span>{settings.storagePath || "正在准备默认目录…"}</span>
+                  </div>
+                  <div className="storage-path-actions">
+                    <button onClick={() => void changeStorageDirectory()}>更改目录</button>
+                    <button onClick={revealStorageDirectory} disabled={!settings.storagePath}>
+                      打开目录
                     </button>
-                  ))}
+                  </div>
+                  <span className="storage-format-hint">每篇便签保存为独立 Markdown 文件</span>
                 </div>
                 <button
                   className="system-theme-button"
@@ -437,6 +858,19 @@ export default function App() {
                   >
                     <Star size={16} fill={activeNote.pinned ? "currentColor" : "none"} />
                   </button>
+                  <div className="note-color-picker" aria-label="便签颜色">
+                    {colors.map((color) => (
+                      <button
+                        key={color}
+                        className={`color-choice color-${color} ${activeNote.color === color ? "active" : ""}`}
+                        onClick={() => updateActive({ color })}
+                        aria-label={`选择 ${color} 颜色`}
+                        aria-pressed={activeNote.color === color}
+                      >
+                        {activeNote.color === color && <Check size={12} />}
+                      </button>
+                    ))}
+                  </div>
                 </div>
 
                 <div className="view-switcher" aria-label="编辑模式">
@@ -505,7 +939,42 @@ export default function App() {
                   placeholder="便签标题"
                   spellCheck={false}
                 />
-                <span className="updated-at">编辑于 {formatTime(activeNote.updatedAt)}</span>
+                <div className="note-heading-meta">
+                  <span className="updated-at">编辑于 {formatTime(activeNote.updatedAt)}</span>
+                  <div className="note-group-setting" aria-label="所属分组">
+                    <Folder size={13} />
+                    <select
+                      value={activeNote.group}
+                      onChange={(event) => updateActive({ group: event.target.value })}
+                      title="修改所属分组"
+                    >
+                      <option value="">未分组</option>
+                      {groups.map((group) => (
+                        <option key={group} value={group}>{group}</option>
+                      ))}
+                    </select>
+                    <button onClick={() => createGroup(true)} title="新建分组并移入" aria-label="新建分组并移入">
+                      <FolderPlus size={14} />
+                    </button>
+                    <button
+                      onClick={renameActiveGroup}
+                      disabled={!activeNote.group}
+                      title="重命名当前分组"
+                      aria-label="重命名当前分组"
+                    >
+                      <Pencil size={13} />
+                    </button>
+                    <button
+                      className="danger"
+                      onClick={deleteActiveGroup}
+                      disabled={!activeNote.group}
+                      title="删除当前分组"
+                      aria-label="删除当前分组"
+                    >
+                      <Trash2 size={13} />
+                    </button>
+                  </div>
+                </div>
               </div>
 
               <div className={`editor-area mode-${settings.viewMode}`}>
