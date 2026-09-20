@@ -1,0 +1,22 @@
+node_modules/
+dist/
+src-tauri/target/
+src-tauri/gen/
+.vite/
+coverage/
+
+# Local environment and secrets
+.env
+.env.*
+!.env.example
+
+# Desktop build artifacts
+*.app
+*.dmg
+*.msi
+*.AppImage
+
+.DS_Store
+*.log
+.idea/
+.vscode/
