@@ -77,7 +77,11 @@ export default function NoteWindow() {
             ]);
             const centerX = position.x + currentSize.width / 2;
             const centerY = position.y + Math.min(currentSize.height / 2, 120 * mainScale);
-            const sidebarRight = mainPosition.x + Math.min(284 * mainScale, mainSize.width);
+            const mainWidth = mainSize.width / mainScale;
+            const sidebarWidth = mainWidth <= 760
+              ? 0
+              : Math.min(284, Math.max(210, mainWidth * 0.2731));
+            const sidebarRight = mainPosition.x + Math.min(sidebarWidth * mainScale, mainSize.width);
             const insideSidebar =
               centerX >= mainPosition.x &&
               centerX <= sidebarRight &&

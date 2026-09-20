@@ -69,6 +69,7 @@ const layerLabels: Record<WindowLayer, string> = {
 };
 
 const isMacOS = /Mac|iPhone|iPad|iPod/i.test(navigator.platform);
+const compactSidebarQuery = "(max-width: 760px)";
 
 function formatTime(value: number) {
   const date = new Date(value);
@@ -95,12 +96,24 @@ export default function App() {
   const [query, setQuery] = useState("");
   const [listFilter, setListFilter] = useState<"all" | "favorites" | "archived">("all");
   const [groupTreeOpen, setGroupTreeOpen] = useState(true);
+  const [sidebarAutoHidden, setSidebarAutoHidden] = useState(() =>
+    window.matchMedia(compactSidebarQuery).matches,
+  );
   const [expandedGroups, setExpandedGroups] = useState<Set<string>>(
     () => new Set(["__ungrouped__"]),
   );
   const [draggingNoteId, setDraggingNoteId] = useState<string | null>(null);
   const [showMore, setShowMore] = useState(false);
   const [showSettings, setShowSettings] = useState(false);
+  const [pendingDelete, setPendingDelete] = useState<
+    { type: "note"; id: string; title: string } | { type: "group"; name: string } | null
+  >(null);
+  const [groupDialog, setGroupDialog] = useState<
+    | { type: "create"; assignActiveNote: boolean }
+    | { type: "rename"; currentGroup: string }
+    | null
+  >(null);
+  const [groupName, setGroupName] = useState("");
   const [systemDark, setSystemDark] = useState(() =>
     window.matchMedia("(prefers-color-scheme: dark)").matches,
   );
@@ -108,7 +121,11 @@ export default function App() {
   const [storageReady, setStorageReady] = useState(() => !isTauri());
   const titleInput = useRef<HTMLInputElement>(null);
   const importInput = useRef<HTMLInputElement>(null);
+  const groupNameInput = useRef<HTMLInputElement>(null);
   const storageInitialized = useRef(false);
+  const storageReadyRef = useRef(storageReady);
+  const notesChangedDuringStorageLoad = useRef(false);
+  const latestNotes = useRef(notes);
   const pointerDrag = useRef<{
     note: Note;
     pointerId: number;
@@ -124,6 +141,7 @@ export default function App() {
   const activeNote =
     notes.find((note) => note.id === activeId && !detachedNoteIds.has(note.id)) ??
     notes.find((note) => !detachedNoteIds.has(note.id));
+  const sidebarVisible = settings.sidebarOpen && !sidebarAutoHidden;
   const groups = useMemo(
     () =>
       Array.from(
@@ -131,6 +149,15 @@ export default function App() {
       ).sort((left, right) => left.localeCompare(right, "zh-CN")),
     [notes, settings.groups],
   );
+
+  const updateNotes = useCallback((updater: (current: Note[]) => Note[]) => {
+    setNotes((current) => {
+      const next = updater(current);
+      latestNotes.current = next;
+      if (!storageReadyRef.current) notesChangedDuringStorageLoad.current = true;
+      return next;
+    });
+  }, []);
 
   useEffect(() => {
     setSaved(false);
@@ -156,17 +183,25 @@ export default function App() {
     if (!isTauri() || storageInitialized.current) return;
     storageInitialized.current = true;
     void (async () => {
-      const directory = settings.storagePath || (await getDefaultStorageDirectory());
-      if (!settings.storagePath) {
-        setSettings((current) => ({ ...current, storagePath: directory }));
+      try {
+        const directory = settings.storagePath || (await getDefaultStorageDirectory());
+        if (!settings.storagePath) {
+          setSettings((current) => ({ ...current, storagePath: directory }));
+        }
+        const storedNotes = await loadNotesFromDirectory(directory);
+        if (notesChangedDuringStorageLoad.current) {
+          await saveNotesToDirectory(directory, latestNotes.current);
+        } else if (storedNotes?.length) {
+          const hydratedNotes = storedNotes.map((note) => ({ ...note, group: note.group ?? "" }));
+          latestNotes.current = hydratedNotes;
+          setNotes(hydratedNotes);
+        } else {
+          await saveNotesToDirectory(directory, latestNotes.current);
+        }
+      } finally {
+        storageReadyRef.current = true;
+        setStorageReady(true);
       }
-      const storedNotes = await loadNotesFromDirectory(directory);
-      if (storedNotes?.length) {
-        setNotes(storedNotes.map((note) => ({ ...note, group: note.group ?? "" })));
-      } else {
-        await saveNotesToDirectory(directory, notes);
-      }
-      setStorageReady(true);
     })();
   }, []);
 
@@ -187,13 +222,20 @@ export default function App() {
   }, []);
 
   useEffect(() => {
+    const media = window.matchMedia(compactSidebarQuery);
+    const updateSidebarVisibility = () => setSidebarAutoHidden(media.matches);
+    media.addEventListener("change", updateSidebarVisibility);
+    return () => media.removeEventListener("change", updateSidebarVisibility);
+  }, []);
+
+  useEffect(() => {
     if (!("__TAURI_INTERNALS__" in window)) return;
     const cleanup: Array<() => void> = [];
     void (async () => {
       const { listen } = await import("@tauri-apps/api/event");
       cleanup.push(
         await listen<Note>("leenote:note-updated", (event) => {
-          setNotes((current) =>
+          updateNotes((current) =>
             current.map((note) => (note.id === event.payload.id ? event.payload : note)),
           );
         }),
@@ -249,7 +291,7 @@ export default function App() {
       );
     })();
     return () => cleanup.forEach((unlisten) => unlisten());
-  }, []);
+  }, [updateNotes]);
 
   useEffect(() => {
     for (const [noteId, position] of Object.entries(settings.detachedNotes)) {
@@ -269,17 +311,17 @@ export default function App() {
 
   const addNote = useCallback(() => {
     const note = createNote();
-    setNotes((current) => [note, ...current]);
+    updateNotes((current) => [note, ...current]);
     setActiveId(note.id);
     setQuery("");
     setListFilter("all");
     window.setTimeout(() => titleInput.current?.select(), 0);
-  }, []);
+  }, [updateNotes]);
 
   const addNoteToGroup = (groupKey: string) => {
     const group = groupKey === "__ungrouped__" ? "" : groupKey;
     const note = { ...createNote(), group };
-    setNotes((current) => [note, ...current]);
+    updateNotes((current) => [note, ...current]);
     setActiveId(note.id);
     setQuery("");
     setListFilter("all");
@@ -315,7 +357,7 @@ export default function App() {
   }, [addNote]);
 
   const updateNote = (noteId: string, patch: Partial<Note>) => {
-    setNotes((current) =>
+    updateNotes((current) =>
       current.map((note) =>
         note.id === noteId ? { ...note, ...patch, updatedAt: Date.now() } : note,
       ),
@@ -326,8 +368,7 @@ export default function App() {
     if (activeNote) updateNote(activeNote.id, patch);
   };
 
-  const createGroup = (assignActiveNote = false) => {
-    const name = window.prompt("新建分组名称")?.trim();
+  const applyCreateGroup = (name: string, assignActiveNote: boolean) => {
     if (!name) return;
     setSettings((current) => ({
       ...current,
@@ -337,12 +378,15 @@ export default function App() {
     setExpandedGroups((current) => new Set(current).add(name));
   };
 
-  const renameActiveGroup = () => {
-    const currentGroup = activeNote?.group;
-    if (!currentGroup) return;
-    const name = window.prompt("重命名分组", currentGroup)?.trim();
+  const createGroup = (assignActiveNote = false) => {
+    setGroupName("");
+    setGroupDialog({ type: "create", assignActiveNote });
+    window.setTimeout(() => groupNameInput.current?.focus(), 0);
+  };
+
+  const applyRenameGroup = (currentGroup: string, name: string) => {
     if (!name || name === currentGroup) return;
-    setNotes((current) =>
+    updateNotes((current) =>
       current.map((note) =>
         note.group === currentGroup ? { ...note, group: name, updatedAt: Date.now() } : note,
       ),
@@ -358,10 +402,16 @@ export default function App() {
     });
   };
 
-  const deleteActiveGroup = () => {
+  const renameActiveGroup = () => {
     const currentGroup = activeNote?.group;
-    if (!currentGroup || !window.confirm(`删除分组“${currentGroup}”？分组内便签将移到未分组。`)) return;
-    setNotes((current) =>
+    if (!currentGroup) return;
+    setGroupName(currentGroup);
+    setGroupDialog({ type: "rename", currentGroup });
+    window.setTimeout(() => groupNameInput.current?.select(), 0);
+  };
+
+  const deleteGroup = (currentGroup: string) => {
+    updateNotes((current) =>
       current.map((note) =>
         note.group === currentGroup ? { ...note, group: "", updatedAt: Date.now() } : note,
       ),
@@ -375,6 +425,12 @@ export default function App() {
       next.delete(currentGroup);
       return next;
     });
+  };
+
+  const deleteActiveGroup = () => {
+    const currentGroup = activeNote?.group;
+    if (!currentGroup) return;
+    setPendingDelete({ type: "group", name: currentGroup });
   };
 
   const filteredNotes = useMemo(() => {
@@ -407,17 +463,22 @@ export default function App() {
     else addNote();
   };
 
-  const deleteActive = () => {
-    if (!activeNote || !window.confirm(`永久删除“${activeNote.title || "无标题"}”？`)) return;
-    const remaining = notes.filter((note) => note.id !== activeNote.id);
+  const deleteNote = (noteId: string) => {
+    const remaining = latestNotes.current.filter((note) => note.id !== noteId);
     if (remaining.length === 0) {
       const replacement = createNote();
-      setNotes([replacement]);
+      updateNotes(() => [replacement]);
       setActiveId(replacement.id);
       return;
     }
-    setNotes(remaining);
+    updateNotes(() => remaining);
     setActiveId(remaining.find((note) => !note.archived)?.id ?? remaining[0].id);
+  };
+
+  const deleteActive = () => {
+    if (!activeNote) return;
+    const title = activeNote.title || "无标题";
+    setPendingDelete({ type: "note", id: activeNote.id, title });
   };
 
   const cycleLayer = () => {
@@ -446,7 +507,7 @@ export default function App() {
   const importMarkdown = async (file: File) => {
     const content = await file.text();
     const note = createNote({ title: file.name.replace(/\.md$/i, ""), content });
-    setNotes((current) => [note, ...current]);
+    updateNotes((current) => [note, ...current]);
     setActiveId(note.id);
     setQuery("");
     setShowMore(false);
@@ -586,27 +647,105 @@ export default function App() {
           event.target.value = "";
         }}
       />
+      {pendingDelete && (
+        <div className="confirm-backdrop" role="presentation">
+          <div className="confirm-dialog" role="alertdialog" aria-modal="true" aria-labelledby="delete-title">
+            <strong id="delete-title">
+              {pendingDelete.type === "note"
+                ? `永久删除“${pendingDelete.title}”？`
+                : `删除分组“${pendingDelete.name}”？`}
+            </strong>
+            <span>
+              {pendingDelete.type === "note" ? "删除后无法恢复。" : "分组内便签将移到未分组。"}
+            </span>
+            <div className="confirm-actions">
+              <button onClick={() => setPendingDelete(null)}>取消</button>
+              <button
+                className="confirm-danger"
+                onClick={() => {
+                  if (pendingDelete.type === "note") deleteNote(pendingDelete.id);
+                  else deleteGroup(pendingDelete.name);
+                  setPendingDelete(null);
+                }}
+              >
+                删除
+              </button>
+            </div>
+          </div>
+        </div>
+      )}
+      {groupDialog && (
+        <div className="confirm-backdrop" role="presentation">
+          <form
+            className="confirm-dialog"
+            role="dialog"
+            aria-modal="true"
+            aria-labelledby="group-dialog-title"
+            onSubmit={(event) => {
+              event.preventDefault();
+              const name = groupName.trim();
+              if (!name) return;
+              if (groupDialog.type === "create") {
+                applyCreateGroup(name, groupDialog.assignActiveNote);
+              } else {
+                applyRenameGroup(groupDialog.currentGroup, name);
+              }
+              setGroupDialog(null);
+            }}
+          >
+            <strong id="group-dialog-title">
+              {groupDialog.type === "create" ? "新建分组" : "重命名分组"}
+            </strong>
+            <input
+              ref={groupNameInput}
+              className="confirm-input"
+              value={groupName}
+              onChange={(event) => setGroupName(event.target.value)}
+              placeholder="分组名称"
+            />
+            <div className="confirm-actions">
+              <button type="button" onClick={() => setGroupDialog(null)}>取消</button>
+              <button type="submit" className="confirm-primary" disabled={!groupName.trim()}>
+                {groupDialog.type === "create" ? "创建" : "保存"}
+              </button>
+            </div>
+          </form>
+        </div>
+      )}
       <header
         className={`titlebar ${isMacOS ? "titlebar-macos" : "titlebar-windows"}`}
         onMouseDown={handleTitlebarMouseDown}
       >
         {isMacOS && (
           <div className="traffic-lights">
-            <button className="traffic close" onClick={() => void closeWindow()} aria-label="隐藏窗口" />
-            <button className="traffic minimize" onClick={() => void minimizeWindow()} aria-label="最小化" />
+            <button className="traffic close" onClick={() => void closeWindow()} aria-label="隐藏窗口">
+              <X size={8} strokeWidth={2.5} />
+            </button>
+            <button className="traffic minimize" onClick={() => void minimizeWindow()} aria-label="最小化">
+              <Minus size={8} strokeWidth={2.5} />
+            </button>
             <button
               className="traffic zoom"
               onClick={() => void toggleMaximizeWindow()}
               aria-label="最大化或还原"
-            />
+            >
+              <Maximize2 size={7} strokeWidth={2.5} />
+            </button>
           </div>
         )}
         <button
           className="icon-button sidebar-toggle"
-          onClick={() => setSettings((current) => ({ ...current, sidebarOpen: !current.sidebarOpen }))}
-          title={settings.sidebarOpen ? "收起便签列表" : "展开便签列表"}
+          onClick={() => {
+            if (!sidebarVisible) {
+              setSidebarAutoHidden(false);
+              setSettings((current) => ({ ...current, sidebarOpen: true }));
+              return;
+            }
+            setSettings((current) => ({ ...current, sidebarOpen: false }));
+          }}
+          title={sidebarVisible ? "收起便签列表" : "展开便签列表"}
         >
-          {settings.sidebarOpen ? <PanelLeftClose size={17} /> : <PanelLeftOpen size={17} />}
+          {sidebarVisible ? <PanelLeftClose size={17} /> : <PanelLeftOpen size={17} />}
         </button>
         <div className="drag-title">
           <span className="brand-mark" aria-hidden="true">
@@ -644,7 +783,7 @@ export default function App() {
       </header>
 
       <div className="workspace">
-        <aside className={`sidebar ${settings.sidebarOpen ? "is-open" : ""}`}>
+        <aside className={`sidebar ${sidebarVisible ? "is-open" : ""}`}>
           <div className="sidebar-head">
             <div className="search-box">
               <Search size={15} />
