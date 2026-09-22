@@ -1,6 +1,7 @@
 import { useEffect, useMemo, useRef, useState, type MouseEvent as ReactMouseEvent } from "react";
-import { Layers2, Minus, PanelLeftOpen, X } from "lucide-react";
+import { KeyRound, Layers2, LockKeyhole, Minus, PanelLeftOpen, X } from "lucide-react";
 import { loadNotes, loadSettings, saveNotes, saveSettings } from "./data";
+import { verifyNotePassword } from "./password";
 import type { Note, WindowLayer } from "./types";
 import { applyWindowLayer, minimizeWindow, startWindowDragging } from "./window";
 
@@ -23,6 +24,10 @@ export default function NoteWindow() {
     loadNotes().find((candidate) => candidate.id === noteId),
   );
   const [settings] = useState(loadSettings);
+  const [unlocked, setUnlocked] = useState(() => !note?.lock);
+  const [password, setPassword] = useState("");
+  const [passwordError, setPasswordError] = useState("");
+  const [unlocking, setUnlocking] = useState(false);
   const [layer, setLayer] = useState<WindowLayer>(
     () => settings.detachedNotes[noteId]?.layer ?? "normal",
   );
@@ -52,7 +57,10 @@ export default function NoteWindow() {
 
       cleanup.push(
         await listen<Note>("leenote:note-updated", (event) => {
-          if (event.payload.id === noteId) setNote(event.payload);
+          if (event.payload.id === noteId) {
+            setNote(event.payload);
+            if (event.payload.lock) setUnlocked(false);
+          }
         }),
       );
 
@@ -147,6 +155,22 @@ export default function NoteWindow() {
     void startWindowDragging();
   };
 
+  const unlockNote = async () => {
+    if (!note?.lock || unlocking) return;
+    setUnlocking(true);
+    setPasswordError("");
+    try {
+      if (await verifyNotePassword(password, note.lock)) {
+        setUnlocked(true);
+        setPassword("");
+      } else {
+        setPasswordError("密码错误");
+      }
+    } finally {
+      setUnlocking(false);
+    }
+  };
+
   if (!note) {
     return <main className="detached-note-shell detached-note-missing">便签不存在</main>;
   }
@@ -155,7 +179,7 @@ export default function NoteWindow() {
     <main className={`detached-note-shell note-${note.color}`}>
       <header className="detached-titlebar" onMouseDown={handleTitlebarMouseDown}>
         <span className="detached-title">
-          {note.title || "无标题便签"}
+          {note.lock && !unlocked ? "已上锁便签" : note.title || "无标题便签"}
         </span>
         <div className="detached-window-actions">
           <button
@@ -177,6 +201,35 @@ export default function NoteWindow() {
           </button>
         </div>
       </header>
+      {note.lock && !unlocked ? (
+        <form
+          className="detached-locked-state"
+          onSubmit={(event) => {
+            event.preventDefault();
+            void unlockNote();
+          }}
+        >
+          <LockKeyhole size={28} />
+          <strong>便签已上锁</strong>
+          <input
+            type="password"
+            value={password}
+            onChange={(event) => {
+              setPassword(event.target.value);
+              setPasswordError("");
+            }}
+            placeholder="输入密码"
+            autoFocus
+            autoComplete="current-password"
+          />
+          {passwordError && <span>{passwordError}</span>}
+          <button type="submit" disabled={!password || unlocking}>
+            <KeyRound size={14} />
+            {unlocking ? "解锁中…" : "解锁"}
+          </button>
+        </form>
+      ) : (
+        <>
       <input
         className="detached-note-title"
         value={note.title}
@@ -195,6 +248,8 @@ export default function NoteWindow() {
         <span>Markdown</span>
         <span>{note.content.length} 字符</span>
       </footer>
+        </>
+      )}
     </main>
   );
 }

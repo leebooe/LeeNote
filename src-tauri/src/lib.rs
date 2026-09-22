@@ -38,6 +38,21 @@ fn choose_storage_directory() -> Option<String> {
         .map(|path| path.to_string_lossy().into_owned())
 }
 
+#[tauri::command]
+fn export_markdown(suggested_name: String, content: String) -> Result<bool, String> {
+    let Some(path) = rfd::FileDialog::new()
+        .set_title("导出 Markdown")
+        .add_filter("Markdown", &["md", "markdown"])
+        .set_file_name(&suggested_name)
+        .save_file()
+    else {
+        return Ok(false);
+    };
+
+    fs::write(path, content).map_err(|error| error.to_string())?;
+    Ok(true)
+}
+
 fn safe_note_file_name(title: &str, id: &str) -> String {
     let mut safe_title = title
         .chars()
@@ -189,6 +204,7 @@ pub fn run() {
         .invoke_handler(tauri::generate_handler![
             default_storage_directory,
             choose_storage_directory,
+            export_markdown,
             load_notes_file,
             save_notes_file,
             open_storage_directory

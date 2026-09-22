@@ -21,7 +21,9 @@ import {
   FolderOpen,
   FolderPlus,
   GripHorizontal,
+  KeyRound,
   Layers2,
+  LockKeyhole,
   Maximize2,
   Menu,
   Minus,
@@ -37,14 +39,17 @@ import {
   Star,
   Sun,
   Trash2,
+  UnlockKeyhole,
   X,
 } from "lucide-react";
 import { createNote, loadNotes, loadSettings, saveNotes, saveSettings } from "./data";
 import { openDetachedNoteWindow } from "./detached";
 import leeNoteLogo from "../assets/leenote-logo-white.png";
 import { renderMarkdown } from "./markdown";
+import { createNoteLock, verifyNotePassword } from "./password";
 import {
   chooseStorageDirectory,
+  exportMarkdown,
   getDefaultStorageDirectory,
   loadNotesFromDirectory,
   openStorageDirectory,
@@ -105,6 +110,14 @@ export default function App() {
   const [draggingNoteId, setDraggingNoteId] = useState<string | null>(null);
   const [showMore, setShowMore] = useState(false);
   const [showSettings, setShowSettings] = useState(false);
+  const [unlockedNoteIds, setUnlockedNoteIds] = useState<Set<string>>(() => new Set());
+  const [lockDialog, setLockDialog] = useState<
+    { mode: "set" | "unlock" | "remove"; noteId: string } | null
+  >(null);
+  const [lockPassword, setLockPassword] = useState("");
+  const [lockPasswordConfirm, setLockPasswordConfirm] = useState("");
+  const [lockError, setLockError] = useState("");
+  const [lockBusy, setLockBusy] = useState(false);
   const [pendingDelete, setPendingDelete] = useState<
     { type: "note"; id: string; title: string } | { type: "group"; name: string } | null
   >(null);
@@ -121,7 +134,9 @@ export default function App() {
   const [storageReady, setStorageReady] = useState(() => !isTauri());
   const titleInput = useRef<HTMLInputElement>(null);
   const importInput = useRef<HTMLInputElement>(null);
+  const noteActions = useRef<HTMLDivElement>(null);
   const groupNameInput = useRef<HTMLInputElement>(null);
+  const lockPasswordInput = useRef<HTMLInputElement>(null);
   const storageInitialized = useRef(false);
   const storageReadyRef = useRef(storageReady);
   const notesChangedDuringStorageLoad = useRef(false);
@@ -141,6 +156,7 @@ export default function App() {
   const activeNote =
     notes.find((note) => note.id === activeId && !detachedNoteIds.has(note.id)) ??
     notes.find((note) => !detachedNoteIds.has(note.id));
+  const activeIsLocked = Boolean(activeNote?.lock && !unlockedNoteIds.has(activeNote.id));
   const sidebarVisible = settings.sidebarOpen && !sidebarAutoHidden;
   const groups = useMemo(
     () =>
@@ -227,6 +243,19 @@ export default function App() {
     media.addEventListener("change", updateSidebarVisibility);
     return () => media.removeEventListener("change", updateSidebarVisibility);
   }, []);
+
+  useEffect(() => {
+    if (!showMore) return;
+
+    const closeMoreMenu = (event: PointerEvent) => {
+      if (!noteActions.current?.contains(event.target as Node)) {
+        setShowMore(false);
+      }
+    };
+
+    document.addEventListener("pointerdown", closeMoreMenu);
+    return () => document.removeEventListener("pointerdown", closeMoreMenu);
+  }, [showMore]);
 
   useEffect(() => {
     if (!("__TAURI_INTERNALS__" in window)) return;
@@ -368,6 +397,76 @@ export default function App() {
     if (activeNote) updateNote(activeNote.id, patch);
   };
 
+  const openLockDialog = (mode: "set" | "unlock" | "remove", noteId: string) => {
+    setLockPassword("");
+    setLockPasswordConfirm("");
+    setLockError("");
+    setLockDialog({ mode, noteId });
+    setShowMore(false);
+    window.setTimeout(() => lockPasswordInput.current?.focus(), 0);
+  };
+
+  const submitLockDialog = async () => {
+    if (!lockDialog || lockBusy) return;
+    const note = latestNotes.current.find((candidate) => candidate.id === lockDialog.noteId);
+    if (!note) {
+      setLockDialog(null);
+      return;
+    }
+    if (lockPassword.length < 6) {
+      setLockError("密码至少需要 6 个字符");
+      return;
+    }
+    if (lockDialog.mode === "set" && lockPassword !== lockPasswordConfirm) {
+      setLockError("两次输入的密码不一致");
+      return;
+    }
+
+    setLockBusy(true);
+    setLockError("");
+    try {
+      if (lockDialog.mode === "set") {
+        const lock = await createNoteLock(lockPassword);
+        updateNote(note.id, { lock });
+        setUnlockedNoteIds((current) => {
+          const next = new Set(current);
+          next.delete(note.id);
+          return next;
+        });
+      } else {
+        if (!note.lock || !(await verifyNotePassword(lockPassword, note.lock))) {
+          setLockError("密码错误");
+          return;
+        }
+        if (lockDialog.mode === "unlock") {
+          setUnlockedNoteIds((current) => new Set(current).add(note.id));
+        } else {
+          updateNote(note.id, { lock: undefined });
+          setUnlockedNoteIds((current) => {
+            const next = new Set(current);
+            next.delete(note.id);
+            return next;
+          });
+        }
+      }
+      setLockDialog(null);
+      setLockPassword("");
+      setLockPasswordConfirm("");
+    } finally {
+      setLockBusy(false);
+    }
+  };
+
+  const lockActiveNow = () => {
+    if (!activeNote?.lock) return;
+    setUnlockedNoteIds((current) => {
+      const next = new Set(current);
+      next.delete(activeNote.id);
+      return next;
+    });
+    setShowMore(false);
+  };
+
   const applyCreateGroup = (name: string, assignActiveNote: boolean) => {
     if (!name) return;
     setSettings((current) => ({
@@ -439,9 +538,13 @@ export default function App() {
       .filter((note) => !detachedNoteIds.has(note.id))
       .filter((note) => (listFilter === "archived" ? note.archived : !note.archived))
       .filter((note) => listFilter !== "favorites" || note.pinned)
-      .filter((note) => !needle || `${note.title}\n${note.content}`.toLocaleLowerCase().includes(needle))
+      .filter((note) => {
+        if (!needle) return true;
+        if (note.lock && !unlockedNoteIds.has(note.id)) return false;
+        return `${note.title}\n${note.content}`.toLocaleLowerCase().includes(needle);
+      })
       .sort((a, b) => Number(b.pinned) - Number(a.pinned) || b.updatedAt - a.updatedAt);
-  }, [detachedNoteIds, listFilter, notes, query]);
+  }, [detachedNoteIds, listFilter, notes, query, unlockedNoteIds]);
 
   const favoriteCount = useMemo(
     () => notes.filter((note) => note.pinned && !note.archived).length,
@@ -491,17 +594,29 @@ export default function App() {
 
   const setViewMode = (viewMode: ViewMode) => setSettings((current) => ({ ...current, viewMode }));
 
-  const exportActive = () => {
+  const exportActive = async () => {
     if (!activeNote) return;
     const safeName = (activeNote.title || "无标题").replace(/[\\/:*?"<>|]/g, "-");
-    const blob = new Blob([activeNote.content], { type: "text/markdown;charset=utf-8" });
-    const url = URL.createObjectURL(blob);
-    const anchor = document.createElement("a");
-    anchor.href = url;
-    anchor.download = `${safeName}.md`;
-    anchor.click();
-    URL.revokeObjectURL(url);
-    setShowMore(false);
+    try {
+      if (isTauri()) {
+        const exported = await exportMarkdown(`${safeName}.md`, activeNote.content);
+        if (exported) setShowMore(false);
+        return;
+      }
+
+      const blob = new Blob([activeNote.content], { type: "text/markdown;charset=utf-8" });
+      const url = URL.createObjectURL(blob);
+      const anchor = document.createElement("a");
+      anchor.href = url;
+      anchor.download = `${safeName}.md`;
+      document.body.appendChild(anchor);
+      anchor.click();
+      anchor.remove();
+      window.setTimeout(() => URL.revokeObjectURL(url), 0);
+      setShowMore(false);
+    } catch (error) {
+      window.alert(`导出失败：${error instanceof Error ? error.message : String(error)}`);
+    }
   };
 
   const importMarkdown = async (file: File) => {
@@ -534,6 +649,10 @@ export default function App() {
 
   const beginDesktopDrag = (event: ReactPointerEvent<HTMLElement>, note: Note) => {
     if (event.button !== 0) return;
+    if (note.lock && !unlockedNoteIds.has(note.id)) {
+      setActiveId(note.id);
+      return;
+    }
     pointerDrag.current = {
       note,
       pointerId: event.pointerId,
@@ -625,8 +744,13 @@ export default function App() {
         <span className="note-row-title">
           {note.title || "无标题"}
           {note.pinned && <Star size={12} fill="currentColor" />}
+          {note.lock && <LockKeyhole size={11} />}
         </span>
-        <span className="note-row-excerpt">{excerpt(note.content) || "空白便签"}</span>
+        <span className="note-row-excerpt">
+          {note.lock && !unlockedNoteIds.has(note.id)
+            ? "输入密码后查看内容"
+            : excerpt(note.content) || "空白便签"}
+        </span>
       </span>
       <span className="note-time">{formatTime(note.updatedAt)}</span>
     </div>
@@ -707,6 +831,61 @@ export default function App() {
               <button type="button" onClick={() => setGroupDialog(null)}>取消</button>
               <button type="submit" className="confirm-primary" disabled={!groupName.trim()}>
                 {groupDialog.type === "create" ? "创建" : "保存"}
+              </button>
+            </div>
+          </form>
+        </div>
+      )}
+      {lockDialog && (
+        <div className="confirm-backdrop" role="presentation">
+          <form
+            className="confirm-dialog"
+            role="dialog"
+            aria-modal="true"
+            aria-labelledby="lock-dialog-title"
+            onSubmit={(event) => {
+              event.preventDefault();
+              void submitLockDialog();
+            }}
+          >
+            <strong id="lock-dialog-title">
+              {{ set: "为便签设置密码", unlock: "解锁便签", remove: "移除便签密码" }[lockDialog.mode]}
+            </strong>
+            <span>
+              {lockDialog.mode === "set"
+                ? "密码使用带随机盐的 PBKDF2-SHA-256 单向哈希保存。"
+                : "请输入当前密码以继续。"}
+            </span>
+            <input
+              ref={lockPasswordInput}
+              className="confirm-input"
+              type="password"
+              value={lockPassword}
+              onChange={(event) => {
+                setLockPassword(event.target.value);
+                setLockError("");
+              }}
+              placeholder="密码（至少 6 个字符）"
+              autoComplete={lockDialog.mode === "set" ? "new-password" : "current-password"}
+            />
+            {lockDialog.mode === "set" && (
+              <input
+                className="confirm-input"
+                type="password"
+                value={lockPasswordConfirm}
+                onChange={(event) => {
+                  setLockPasswordConfirm(event.target.value);
+                  setLockError("");
+                }}
+                placeholder="再次输入密码"
+                autoComplete="new-password"
+              />
+            )}
+            {lockError && <span className="confirm-error" role="alert">{lockError}</span>}
+            <div className="confirm-actions">
+              <button type="button" onClick={() => setLockDialog(null)} disabled={lockBusy}>取消</button>
+              <button type="submit" className="confirm-primary" disabled={lockBusy || !lockPassword}>
+                {lockBusy ? "处理中…" : { set: "设置并锁定", unlock: "解锁", remove: "移除密码" }[lockDialog.mode]}
               </button>
             </div>
           </form>
@@ -987,6 +1166,17 @@ export default function App() {
 
         <section className="note-stage">
           {activeNote ? (
+            activeIsLocked ? (
+              <div className="locked-note-state">
+                <div className="locked-note-icon"><LockKeyhole size={28} /></div>
+                <strong>这张便签已上锁</strong>
+                <span>输入密码后可在本次运行期间查看和编辑。</span>
+                <button onClick={() => openLockDialog("unlock", activeNote.id)}>
+                  <KeyRound size={15} />
+                  输入密码解锁
+                </button>
+              </div>
+            ) : (
             <>
               <div className="note-toolbar">
                 <div className="note-meta">
@@ -1036,7 +1226,7 @@ export default function App() {
                   </button>
                 </div>
 
-                <div className="note-actions">
+                <div ref={noteActions} className="note-actions">
                   <button
                     className="icon-button"
                     onClick={toggleArchiveActive}
@@ -1064,6 +1254,23 @@ export default function App() {
                         <FileDown size={15} />
                         导出为 .md
                       </button>
+                      {activeNote.lock ? (
+                        <>
+                          <button onClick={lockActiveNow}>
+                            <LockKeyhole size={15} />
+                            立即锁定
+                          </button>
+                          <button onClick={() => openLockDialog("remove", activeNote.id)}>
+                            <UnlockKeyhole size={15} />
+                            移除密码
+                          </button>
+                        </>
+                      ) : (
+                        <button onClick={() => openLockDialog("set", activeNote.id)}>
+                          <LockKeyhole size={15} />
+                          为便签上锁
+                        </button>
+                      )}
                     </div>
                   )}
                 </div>
@@ -1140,6 +1347,7 @@ export default function App() {
                 <span>{activeNote.content.split(/\s+/).filter(Boolean).length} 词</span>
               </footer>
             </>
+            )
           ) : (
             <div className="empty-state">
               <Menu size={28} />

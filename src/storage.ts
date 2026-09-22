@@ -12,6 +12,11 @@ export async function chooseStorageDirectory() {
   return invoke<string | null>("choose_storage_directory");
 }
 
+export async function exportMarkdown(suggestedName: string, content: string) {
+  if (!isTauri()) return null;
+  return invoke<boolean>("export_markdown", { suggestedName, content });
+}
+
 export async function loadNotesFromDirectory(directory: string) {
   if (!isTauri() || !directory) return null;
   return invoke<Note[] | null>("load_notes_file", { directory });

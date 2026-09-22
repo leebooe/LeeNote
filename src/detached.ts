@@ -19,7 +19,7 @@ export function openDetachedNoteWindow(note: Note, state: DetachedNoteState) {
 
     const noteWindow = new WebviewWindow(label, {
       url: `index.html?note=${encodeURIComponent(note.id)}`,
-      title: note.title || "无标题便签",
+      title: note.lock ? "已上锁便签" : note.title || "无标题便签",
       x: Math.round(state.x),
       y: Math.round(state.y),
       width: 380,

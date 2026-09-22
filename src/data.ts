@@ -44,7 +44,11 @@ export function loadNotes(): Note[] {
   try {
     const raw = localStorage.getItem(NOTES_KEY);
     if (raw) {
-      return (JSON.parse(raw) as Note[]).map((note) => ({ ...note, group: note.group ?? "" }));
+      return (JSON.parse(raw) as Note[]).map((note) => ({
+        ...note,
+        group: note.group ?? "",
+        lock: note.lock?.algorithm === "PBKDF2-SHA-256" ? note.lock : undefined,
+      }));
     }
   } catch {
     // Corrupted local data falls back to the starter note.
