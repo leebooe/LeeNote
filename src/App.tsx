@@ -43,6 +43,8 @@ import {
   X,
 } from "lucide-react";
 import { createNote, loadNotes, loadSettings, saveNotes, saveSettings } from "./data";
+import { mergeBackup, type NoteBackup } from "./backup";
+import WebDavDialog from "./WebDavDialog";
 import { openDetachedNoteWindow } from "./detached";
 import leeNoteLogo from "../assets/leenote-logo-white.png";
 import { renderMarkdown } from "./markdown";
@@ -110,6 +112,7 @@ export default function App() {
   const [draggingNoteId, setDraggingNoteId] = useState<string | null>(null);
   const [showMore, setShowMore] = useState(false);
   const [showSettings, setShowSettings] = useState(false);
+  const [showWebDav, setShowWebDav] = useState(false);
   const [unlockedNoteIds, setUnlockedNoteIds] = useState<Set<string>>(() => new Set());
   const [lockDialog, setLockDialog] = useState<
     { mode: "set" | "unlock" | "remove"; noteId: string } | null
@@ -639,6 +642,16 @@ export default function App() {
     if (settings.storagePath) void openStorageDirectory(settings.storagePath);
   };
 
+  const restoreWebDavBackup = (backup: NoteBackup) => {
+    updateNotes((current) => mergeBackup(current, backup));
+    setSettings((current) => ({
+      ...current,
+      groups: Array.from(new Set([...current.groups, ...backup.groups])),
+    }));
+    setQuery("");
+    setListFilter("all");
+  };
+
   const effectiveTheme = settings.theme === "system" ? (systemDark ? "dark" : "light") : settings.theme;
 
   const handleTitlebarMouseDown = (event: ReactMouseEvent<HTMLElement>) => {
@@ -771,6 +784,14 @@ export default function App() {
           event.target.value = "";
         }}
       />
+      {showWebDav && (
+        <WebDavDialog
+          ready={storageReady}
+          getSnapshot={() => ({ notes: latestNotes.current, groups })}
+          onRestore={restoreWebDavBackup}
+          onClose={() => setShowWebDav(false)}
+        />
+      )}
       {pendingDelete && (
         <div className="confirm-backdrop" role="presentation">
           <div className="confirm-dialog" role="alertdialog" aria-modal="true" aria-labelledby="delete-title">
@@ -1152,6 +1173,14 @@ export default function App() {
                   </div>
                   <span className="storage-format-hint">每篇便签保存为独立 Markdown 文件</span>
                 </div>
+                <button
+                  className="webdav-settings-button"
+                  disabled={!isTauri()}
+                  title={isTauri() ? "配置 WebDAV 备份与恢复" : "请在桌面应用中使用 WebDAV 备份"}
+                  onClick={() => { setShowSettings(false); setShowWebDav(true); }}
+                >
+                  <FileUp size={14} />WebDAV 备份与恢复<ChevronRight size={14} />
+                </button>
                 <button
                   className="system-theme-button"
                   onClick={() => setSettings((current) => ({ ...current, theme: "system" }))}

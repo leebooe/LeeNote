@@ -10,6 +10,8 @@ use std::{
     process::Command,
 };
 
+mod webdav;
+
 const LEGACY_NOTES_FILE_NAME: &str = "leenote-notes.json";
 const NOTES_INDEX_FILE_NAME: &str = "leenote-index.json";
 
@@ -207,7 +209,12 @@ pub fn run() {
             export_markdown,
             load_notes_file,
             save_notes_file,
-            open_storage_directory
+            open_storage_directory,
+            webdav::load_webdav_config,
+            webdav::save_webdav_config,
+            webdav::test_webdav_connection,
+            webdav::upload_webdav_backup,
+            webdav::download_webdav_backup
         ])
         .setup(|app| {
             let show = MenuItem::with_id(app, "show", "显示 LeeNote", true, None::<&str>)?;
